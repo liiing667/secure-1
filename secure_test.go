@@ -1232,21 +1232,21 @@ func TestIsSSL(t *testing.T) {
 	})
 
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
-	expect(t, s.isSSL(req), false)
+	expect(t, s.isSSL(req, true), false)
 
 	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
 	req.TLS = &tls.ConnectionState{
 		CipherSuite: 16,
 	}
-	expect(t, s.isSSL(req), true)
+	expect(t, s.isSSL(req, true), true)
 
 	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
 	req.URL.Scheme = httpsSchema
-	expect(t, s.isSSL(req), false)
+	expect(t, s.isSSL(req, true), false)
 
 	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
 	req.Header.Add("X-Forwarded-Proto", "https")
-	expect(t, s.isSSL(req), true)
+	expect(t, s.isSSL(req, true), true)
 }
 
 func TestSSLForceHostWithHTTPS(t *testing.T) {

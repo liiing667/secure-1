@@ -3,6 +3,7 @@ package secure
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
@@ -122,6 +123,14 @@ type Options struct {
 	// SSLProxyHeaders is set of header keys with associated values that would indicate a valid https request. Useful when using Nginx: `map[string]string{"X-Forwarded-Proto": "https"}`. Default is blank map.
 	// Only configure headers that a trusted reverse proxy sets or overwrites, and prevent clients from accessing the backend directly.
 	SSLProxyHeaders map[string]string
+	// TrustedProxies is a list of CIDR ranges (for example "10.0.0.0/8" or "2001:db8::/32") that are allowed to set HostsProxyHeaders and SSLProxyHeaders.
+	// A bare IP address is accepted as a single-address range. When empty and TrustProxyFunc is nil, proxy headers retain their legacy behavior and are trusted for every request.
+	// Requests from peers outside these ranges cannot influence the resolved host or HTTPS state; their proxy headers are ignored (fail closed). Default is an empty slice.
+	TrustedProxies []string
+	// TrustProxyFunc is a custom function that determines whether a request comes from a trusted reverse proxy.
+	// It is called in addition to TrustedProxies: a request is trusted when the function returns true or r.RemoteAddr belongs to a TrustedProxies range.
+	// When nil and TrustedProxies is empty, proxy headers retain their legacy behavior and are trusted for every request. Default is nil.
+	TrustProxyFunc TrustProxyFunc `json:"-" toml:"-" yaml:"-"`
 	// STSSeconds is the max-age of the Strict-Transport-Security header. Default is 0, which would NOT include the header.
 	STSSeconds int64
 	// SecureContextKey allows a custom key to be specified for context storage.
@@ -143,6 +152,10 @@ type Secure struct {
 	// cRegexAllowedHosts saves the compiled regular expressions of the AllowedHosts
 	// option for subsequent use in processRequest
 	cRegexAllowedHosts []*regexp.Regexp
+
+	// trustedProxyNetworks saves the parsed CIDR ranges of the TrustedProxies
+	// option for subsequent use in processRequest.
+	trustedProxyNetworks []*net.IPNet
 
 	// ctxSecureHeaderKey is the key used for context storage for request modification.
 	ctxSecureHeaderKey secureCtxKey
@@ -175,6 +188,25 @@ func New(options ...Options) *Secure {
 
 			s.cRegexAllowedHosts = append(s.cRegexAllowedHosts, regex)
 		}
+	}
+
+	for _, trustedProxy := range o.TrustedProxies {
+		// Accept bare IP addresses as single-host ranges.
+		if ip := net.ParseIP(trustedProxy); ip != nil {
+			bits := 32
+			if ip.To4() == nil {
+				bits = 128
+			}
+
+			trustedProxy = fmt.Sprintf("%s/%d", ip.String(), bits)
+		}
+
+		_, network, err := net.ParseCIDR(trustedProxy)
+		if err != nil {
+			panic(fmt.Sprintf("Error parsing TrustedProxies: %s", err))
+		}
+
+		s.trustedProxyNetworks = append(s.trustedProxyNetworks, network)
 	}
 
 	s.ctxSecureHeaderKey = ctxDefaultSecureHeaderKey
@@ -303,16 +335,11 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 		r = withCSPNonce(r, cspRandNonce())
 	}
 
-	// Resolve the host for the request, using proxy headers if present.
-	host := r.Host
-
-	for _, header := range s.opt.HostsProxyHeaders {
-		if h := r.Header.Get(header); h != "" {
-			host = h
-
-			break
-		}
-	}
+	// Resolve the host for the request. Proxy headers are only honored when the
+	// immediate peer is a trusted proxy; untrusted, malformed or conflicting
+	// values fail closed and fall back to the real r.Host.
+	trusted := s.isTrustedProxy(r)
+	host := s.proxyHost(r, trusted)
 
 	// Allowed hosts check.
 	if len(s.opt.AllowedHosts) > 0 && !s.opt.IsDevelopment {
@@ -344,7 +371,7 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 	}
 
 	// Determine if we are on HTTPS.
-	ssl := s.isSSL(r)
+	ssl := s.isSSL(r, trusted)
 
 	// SSL check.
 	if s.opt.SSLRedirect && !ssl && !s.opt.IsDevelopment {
@@ -499,21 +526,11 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 	return responseHeader, r, nil
 }
 
-// isSSL determine if we are on HTTPS.
-func (s *Secure) isSSL(r *http.Request) bool {
+// isSSL determine if we are on HTTPS. The trusted flag states whether the
+// immediate peer is allowed to set the configured SSL proxy headers.
+func (s *Secure) isSSL(r *http.Request, trusted bool) bool {
 	// The request URL's scheme can be supplied by a client over plaintext HTTP.
-	ssl := r.TLS != nil
-	if !ssl {
-		for k, v := range s.opt.SSLProxyHeaders {
-			if r.Header.Get(k) == v {
-				ssl = true
-
-				break
-			}
-		}
-	}
-
-	return ssl
+	return r.TLS != nil || s.proxySSL(r, trusted)
 }
 
 // ModifyResponseHeaders modifies the Response.
@@ -526,7 +543,7 @@ func (s *Secure) ModifyResponseHeaders(res *http.Response) error {
 		// And the response location header includes the SSLHost as the domain with a trailing slash,
 		// Or an exact match to the SSLHost.
 		location := res.Header.Get("Location")
-		if s.isSSL(res.Request) &&
+		if s.isSSL(res.Request, s.isTrustedProxy(res.Request)) &&
 			len(s.opt.SSLHost) > 0 &&
 			(strings.HasPrefix(location, fmt.Sprintf("http://%s/", s.opt.SSLHost)) || location == fmt.Sprintf("http://%s", s.opt.SSLHost)) {
 			location = strings.Replace(location, "http:", "https:", 1)

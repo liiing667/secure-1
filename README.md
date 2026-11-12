@@ -70,6 +70,8 @@ s := secure.New(secure.Options{
     SSLHost: "ssl.example.com", // SSLHost is the host name that is used to redirect HTTP requests to HTTPS. Default is "", which indicates to use the same host.
     SSLHostFunc: nil, // SSLHostFunc is a function pointer, the return value of the function is the host name that has same functionality as `SSHost`. Default is nil. If SSLHostFunc is nil, the `SSLHost` option will be used.
     SSLProxyHeaders: map[string]string{"X-Forwarded-Proto": "https"}, // SSLProxyHeaders is set of header keys with associated values that would indicate a valid HTTPS request. Useful when using Nginx: `map[string]string{"X-Forwarded-Proto": "https"}`. Default is blank map.
+    TrustedProxies: []string{"10.0.0.0/8", "2001:db8::/32"}, // TrustedProxies is a list of CIDR ranges (a bare IP address is accepted as a single-address range) whose immediate peers are allowed to set HostsProxyHeaders and SSLProxyHeaders. Requests from peers outside these ranges have their proxy headers ignored (fail closed). Default is an empty slice, which keeps the legacy behavior of trusting proxy headers for every request.
+    TrustProxyFunc: nil, // TrustProxyFunc is a custom function `func(r *http.Request) bool` that grants trust in addition to TrustedProxies. When nil and TrustedProxies is empty, proxy headers retain their legacy behavior. Default is nil.
     STSSeconds: 31536000, // STSSeconds is the max-age of the Strict-Transport-Security header. Default is 0, which would NOT include the header.
     STSIncludeSubdomains: true, // If STSIncludeSubdomains is set to true, the `includeSubdomains` will be appended to the Strict-Transport-Security header. Default is false.
     STSPreload: true, // If STSPreload is set to true, the `preload` flag will be appended to the Strict-Transport-Security header. Default is false.
@@ -110,6 +112,8 @@ l := secure.New(secure.Options{
     SSLTemporaryRedirect: false,
     SSLHost: "",
     SSLProxyHeaders: map[string]string{},
+    TrustedProxies: []string{},
+    TrustProxyFunc: nil,
     STSSeconds: 0,
     STSIncludeSubdomains: false,
     STSPreload: false,
@@ -185,6 +189,28 @@ func main() {
 ~~~
 
 HTTPS detection uses the request's TLS state or explicitly configured `SSLProxyHeaders`. The request URL's scheme is not evidence of TLS. When TLS terminates at a reverse proxy, configure only headers that the trusted proxy sets or overwrites, and prevent clients from accessing the backend directly.
+
+### Trusting reverse proxies
+`HostsProxyHeaders` and `SSLProxyHeaders` are client-controlled HTTP headers. If edge proxies are reachable but clients can also reach the backend directly, a direct client can forge those headers to spoof the host, bypass the HTTP-to-HTTPS redirect, or obtain an STS header over plaintext. Configure `TrustedProxies` (and optionally `TrustProxyFunc`) so the headers are only read when the immediate peer (`r.RemoteAddr`) is a trusted reverse proxy:
+
+~~~ go
+secureMiddleware := secure.New(secure.Options{
+    HostsProxyHeaders: []string{"X-Forwarded-Host"},
+    SSLProxyHeaders:   map[string]string{"X-Forwarded-Proto": "https"},
+    TrustedProxies:    []string{"10.0.0.0/8", "2001:db8::/32"}, // bare IPs such as "10.1.2.3" are also accepted.
+    // TrustProxyFunc can grant trust based on anything in the request, in addition to TrustedProxies.
+    TrustProxyFunc: func(r *http.Request) bool { return r.RemoteAddr == "127.0.0.1:0" },
+})
+~~~
+
+When either option is configured, the following fail-closed rules apply:
+
+* Requests from peers outside the trusted ranges ignore every proxy header, so host resolution falls back to the real `r.Host` and HTTPS detection relies on the actual TLS state.
+* Malformed or duplicate host headers (multiple header lines, a comma-separated list, embedded whitespace, or an invalid host syntax) are ignored in favor of the real `r.Host`, so a redirect can never be pointed at an attacker-controlled host.
+* Duplicate, conflicting, or unexpected `SSLProxyHeaders` values never upgrade a plaintext connection to HTTPS.
+* A request without a parseable `RemoteAddr` is treated as untrusted.
+
+For backwards compatibility, when neither `TrustedProxies` nor `TrustProxyFunc` is set, proxy headers retain their historical behavior and are trusted for every request.
 
 ### Strict Transport Security
 The STS header will only be sent on verified HTTPS connections (and when `IsDevelopment` is false). Be sure to set the `SSLProxyHeaders` option if your application is behind a proxy to ensure the proper behavior. If you need the STS header for all HTTP and HTTPS requests (which you [shouldn't](http://tools.ietf.org/html/rfc6797#section-7.2)), you can use the `ForceSTSHeader` option. Note that if `IsDevelopment` is true, it will still disable this header even when `ForceSTSHeader` is set to true.
