@@ -185,6 +185,153 @@ func TestBadSingleAllowHostsProxyHeaders(t *testing.T) {
 	expect(t, res.Code, http.StatusInternalServerError)
 }
 
+func TestTrustedProxiesForgedHostHeaderRejected(t *testing.T) {
+	s := New(Options{
+		AllowedHosts:      []string{"www.example.com"},
+		HostsProxyHeaders: []string{"X-Forwarded-Host"},
+		TrustedProxies:    []string{"10.0.0.0/8"},
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = "example-internal"
+	req.RemoteAddr = "203.0.113.5:12345"
+	req.Header.Set("X-Forwarded-Host", "www.example.com")
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	// The untrusted peer's proxy header must be ignored, so the internal host is rejected.
+	expect(t, res.Code, http.StatusInternalServerError)
+}
+
+func TestTrustedProxiesTrustedHostHeaderAccepted(t *testing.T) {
+	s := New(Options{
+		AllowedHosts:      []string{"www.example.com"},
+		HostsProxyHeaders: []string{"X-Forwarded-Host"},
+		TrustedProxies:    []string{"10.0.0.0/8"},
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = "example-internal"
+	req.RemoteAddr = "10.1.2.3:12345"
+	req.Header.Set("X-Forwarded-Host", "www.example.com")
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusOK)
+	expect(t, res.Body.String(), `bar`)
+}
+
+func TestTrustedProxiesIPv6(t *testing.T) {
+	s := New(Options{
+		AllowedHosts:      []string{"www.example.com"},
+		HostsProxyHeaders: []string{"X-Forwarded-Host"},
+		TrustedProxies:    []string{"fd00::/8"},
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = "example-internal"
+	req.RemoteAddr = "[fd00::1]:443"
+	req.Header.Set("X-Forwarded-Host", "www.example.com")
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusOK)
+
+	res = httptest.NewRecorder()
+	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = "example-internal"
+	req.RemoteAddr = "[2001:db8::1]:443"
+	req.Header.Set("X-Forwarded-Host", "www.example.com")
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusInternalServerError)
+}
+
+func TestTrustedProxiesSingleIPAndDirectConnection(t *testing.T) {
+	s := New(Options{
+		AllowedHosts:      []string{"www.example.com"},
+		HostsProxyHeaders: []string{"X-Forwarded-Host"},
+		TrustedProxies:    []string{"10.0.0.1"},
+	})
+
+	// A direct connection without proxy headers is unaffected.
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = exampleHost
+	req.RemoteAddr = "192.0.2.10:8080"
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusOK)
+
+	// A single IP entry (no CIDR suffix) trusts that exact peer, even without a port.
+	res = httptest.NewRecorder()
+	req, _ = http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = "example-internal"
+	req.RemoteAddr = "10.0.0.1"
+	req.Header.Set("X-Forwarded-Host", "www.example.com")
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusOK)
+}
+
+func TestTrustedProxiesForgedProtoRejected(t *testing.T) {
+	s := New(Options{
+		SSLRedirect:     true,
+		SSLProxyHeaders: map[string]string{"X-Forwarded-Proto": "https"},
+		TrustedProxies:  []string{"192.168.0.0/16"},
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = exampleHost
+	req.URL.Scheme = httpSchema
+	req.RemoteAddr = "203.0.113.9:5555"
+	req.Header.Set("X-Forwarded-Proto", "https")
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	// The forged proto header must be ignored, so the plain HTTP request is redirected.
+	expect(t, res.Code, http.StatusMovedPermanently)
+	expect(t, res.Header().Get("Location"), "https://www.example.com/foo")
+}
+
+func TestTrustedProxiesTrustedProtoAccepted(t *testing.T) {
+	s := New(Options{
+		SSLRedirect:     true,
+		SSLProxyHeaders: map[string]string{"X-Forwarded-Proto": "https"},
+		TrustedProxies:  []string{"192.168.0.0/16"},
+		STSSeconds:      31536000,
+	})
+
+	res := httptest.NewRecorder()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "/foo", nil)
+	req.Host = exampleHost
+	req.URL.Scheme = httpSchema
+	req.RemoteAddr = "192.168.1.10:5555"
+	req.Header.Set("X-Forwarded-Proto", "https")
+
+	s.Handler(myHandler).ServeHTTP(res, req)
+
+	expect(t, res.Code, http.StatusOK)
+	expect(t, res.Header().Get("Strict-Transport-Security"), "max-age=31536000")
+}
+
+func TestTrustedProxiesInvalidEntryPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected New to panic on an invalid TrustedProxies entry")
+		}
+	}()
+
+	New(Options{TrustedProxies: []string{"not-a-cidr"}})
+}
+
 func TestGoodMultipleAllowHosts(t *testing.T) {
 	s := New(Options{
 		AllowedHosts: []string{"www.example.com", "sub.example.com"},

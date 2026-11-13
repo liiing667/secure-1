@@ -3,6 +3,7 @@ package secure
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
@@ -122,6 +123,11 @@ type Options struct {
 	// SSLProxyHeaders is set of header keys with associated values that would indicate a valid https request. Useful when using Nginx: `map[string]string{"X-Forwarded-Proto": "https"}`. Default is blank map.
 	// Only configure headers that a trusted reverse proxy sets or overwrites, and prevent clients from accessing the backend directly.
 	SSLProxyHeaders map[string]string
+	// TrustedProxies is a list of trusted proxy IP addresses or CIDR ranges (IPv4 and IPv6). When set, the
+	// HostsProxyHeaders and SSLProxyHeaders are only honored if the request's remote peer falls within one of
+	// these ranges, preventing clients from forging proxy headers. Default is an empty slice, which preserves
+	// the legacy behavior of trusting proxy headers from any peer.
+	TrustedProxies []string
 	// STSSeconds is the max-age of the Strict-Transport-Security header. Default is 0, which would NOT include the header.
 	STSSeconds int64
 	// SecureContextKey allows a custom key to be specified for context storage.
@@ -143,6 +149,10 @@ type Secure struct {
 	// cRegexAllowedHosts saves the compiled regular expressions of the AllowedHosts
 	// option for subsequent use in processRequest
 	cRegexAllowedHosts []*regexp.Regexp
+
+	// trustedProxyNets saves the parsed IP networks of the TrustedProxies
+	// option for subsequent use in processRequest
+	trustedProxyNets []*net.IPNet
 
 	// ctxSecureHeaderKey is the key used for context storage for request modification.
 	ctxSecureHeaderKey secureCtxKey
@@ -175,6 +185,15 @@ func New(options ...Options) *Secure {
 
 			s.cRegexAllowedHosts = append(s.cRegexAllowedHosts, regex)
 		}
+	}
+
+	for _, trustedProxy := range o.TrustedProxies {
+		_, ipNet, err := parseIPOrCIDR(trustedProxy)
+		if err != nil {
+			panic(fmt.Sprintf("Error parsing TrustedProxies entry %q: %s", trustedProxy, err))
+		}
+
+		s.trustedProxyNets = append(s.trustedProxyNets, ipNet)
 	}
 
 	s.ctxSecureHeaderKey = ctxDefaultSecureHeaderKey
@@ -306,11 +325,13 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 	// Resolve the host for the request, using proxy headers if present.
 	host := r.Host
 
-	for _, header := range s.opt.HostsProxyHeaders {
-		if h := r.Header.Get(header); h != "" {
-			host = h
+	if s.isTrustedProxy(r) {
+		for _, header := range s.opt.HostsProxyHeaders {
+			if h := r.Header.Get(header); h != "" {
+				host = h
 
-			break
+				break
+			}
 		}
 	}
 
@@ -503,7 +524,7 @@ func (s *Secure) processRequest(w http.ResponseWriter, r *http.Request) (http.He
 func (s *Secure) isSSL(r *http.Request) bool {
 	// The request URL's scheme can be supplied by a client over plaintext HTTP.
 	ssl := r.TLS != nil
-	if !ssl {
+	if !ssl && s.isTrustedProxy(r) {
 		for k, v := range s.opt.SSLProxyHeaders {
 			if r.Header.Get(k) == v {
 				ssl = true
@@ -514,6 +535,57 @@ func (s *Secure) isSSL(r *http.Request) bool {
 	}
 
 	return ssl
+}
+
+// isTrustedProxy determines if the request's remote peer is a trusted proxy.
+// When no TrustedProxies are configured, all peers are trusted (legacy behavior).
+func (s *Secure) isTrustedProxy(r *http.Request) bool {
+	if len(s.trustedProxyNets) == 0 {
+		return true
+	}
+
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+
+	// Strip any IPv6 zone identifier.
+	if i := strings.LastIndex(host, "%"); i > -1 {
+		host = host[:i]
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+
+	for _, ipNet := range s.trustedProxyNets {
+		if ipNet.Contains(ip) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// parseIPOrCIDR parses a string containing either a CIDR range or a single IP
+// address (IPv4 or IPv6) into a *net.IPNet.
+func parseIPOrCIDR(s string) (net.IP, *net.IPNet, error) {
+	if strings.Contains(s, "/") {
+		return net.ParseCIDR(s)
+	}
+
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return nil, nil, fmt.Errorf("invalid IP address: %s", s)
+	}
+
+	bits := 128
+	if ip.To4() != nil {
+		bits = 32
+	}
+
+	return ip, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}, nil
 }
 
 // ModifyResponseHeaders modifies the Response.
